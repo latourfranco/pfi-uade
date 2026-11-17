@@ -1,0 +1,17 @@
+.venv/
+.env
+.git/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage-python.info
+coverage_html/
+evidence_storage/
+_temp_archive/
+tests/
+scripts/
+*.webp
+*.png
+*.log

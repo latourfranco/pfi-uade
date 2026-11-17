@@ -1,0 +1,10 @@
+{
+  "deno.enable": false,
+  "deno.enablePaths": ["supabase/functions"],
+  "python.analysis.extraPaths": [
+    "pipeline/01_extraccion",
+    "pipeline/02_deteccion_friccion",
+    "pipeline/03_exploracion",
+    "pipeline/04_generacion_insights"
+  ]
+}

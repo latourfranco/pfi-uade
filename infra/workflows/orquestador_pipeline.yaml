@@ -1,0 +1,514 @@
+main:
+  params: [entrada]
+  steps:
+    # -------------------------------------------------------------------------
+    # 0. INICIALIZACIÓN DE VARIABLES Y PARÁMETROS DEL CICLO
+    # -------------------------------------------------------------------------
+    - inicializar:
+        assign:
+          - id_proyecto: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - region: "us-central1"
+          - zona_horaria: "America/Argentina/Buenos_Aires"
+          # Si Cloud Scheduler o una ejecución manual no envía "fecha_ejecucion",
+          # toma la fecha actual T en la zona horaria de Argentina (YYYY-MM-DD).
+          # El módulo de Extracción calcula internamente T-1 para consultar GA4.
+          - fecha_ejecucion: ${default(map.get(entrada, "fecha_ejecucion"), text.substring(time.format(sys.now(), zona_horaria), 0, 10))}
+          - url_extraccion: "https://mod-extraccion-631481253247.us-central1.run.app/extraer"
+          - url_notificaciones: "https://qipcdqwhjwzplairbxzt.supabase.co/functions/v1/notificaciones"
+          # Nombres de secretos en GCP Secret Manager
+          - nombre_secreto_notificaciones: "secreto-workflow-notificaciones"
+          - nombre_secreto_supabase_anon: "supabase-anon-key"
+          - nombre_secreto_runpod_api: "runpod-api-key"
+          - nombre_secreto_vllm_api: "vllm-api-key"
+          # Configuración del Pod vLLM en RunPod
+          - nombre_pod_runpod: "friccion-llm"
+          - pod_id: null
+
+    # -------------------------------------------------------------------------
+    # 1. MÓDULO DE EXTRACCIÓN (Cloud Run Service - Una sola ejecución)
+    # -------------------------------------------------------------------------
+    - paso_1_extraccion:
+        try:
+          call: http.post
+          args:
+            url: ${url_extraccion}
+            auth:
+              type: OIDC
+              audience: ${url_extraccion}
+            body:
+              fecha_ejecucion: ${fecha_ejecucion}
+            timeout: 1800
+          result: respuesta_extraccion
+        retry:
+          predicate: ${predicado_reintento_http}
+          max_retries: 3
+          backoff:
+            initial_delay: 5
+            max_delay: 60
+            multiplier: 2
+
+    - evaluar_extraccion:
+        assign:
+          - ids_clientes: ${respuesta_extraccion.body.clientes_exitosos}
+          - total_clientes: ${len(ids_clientes)}
+        next: verificar_clientes_activos
+
+    - verificar_clientes_activos:
+        switch:
+          - condition: ${total_clientes == 0}
+            next: finalizar_sin_clientes
+
+    # -------------------------------------------------------------------------
+    # 1B. ENCENDIDO DEL POD vLLM EN RUNPOD (solo si hay clientes activos)
+    # -------------------------------------------------------------------------
+    - obtener_secreto_runpod_api:
+        call: googleapis.secretmanager.v1.projects.secrets.versions.accessString
+        args:
+          secret_id: ${nombre_secreto_runpod_api}
+          project_id: ${id_proyecto}
+        result: runpod_api_key
+
+    - obtener_secreto_vllm_api:
+        call: googleapis.secretmanager.v1.projects.secrets.versions.accessString
+        args:
+          secret_id: ${nombre_secreto_vllm_api}
+          project_id: ${id_proyecto}
+        result: vllm_api_key
+
+    - encender_pod:
+        call: encender_pod_runpod
+        args:
+          nombre_pod: ${nombre_pod_runpod}
+          runpod_api_key: ${runpod_api_key}
+          vllm_api_key: ${vllm_api_key}
+        result: pod_id
+
+    # -------------------------------------------------------------------------
+    # 2–5. EJECUCIÓN DEL PIPELINE CON APAGADO GARANTIZADO DEL POD AL FINALIZAR
+    # -------------------------------------------------------------------------
+    - ejecutar_pipeline_con_pod:
+        try:
+          steps:
+            # 2. MÓDULO DE DETECCIÓN DE FRICCIÓN (Cloud Run Job - 1 tarea por cliente)
+            - paso_2_deteccion:
+                call: ejecutar_trabajo_etapa
+                args:
+                  id_proyecto: ${id_proyecto}
+                  region: ${region}
+                  nombre_trabajo: "trabajo-deteccion-friccion"
+                  etiqueta_etapa: "DETECCION_DE_FRICCION"
+                  fecha_ejecucion: ${fecha_ejecucion}
+                  ids_clientes: ${ids_clientes}
+                result: resultado_deteccion
+
+            # 3. MÓDULO DE EXPLORACIÓN (Cloud Run Job - 1 tarea por cliente)
+            - paso_3_exploracion:
+                call: ejecutar_trabajo_etapa
+                args:
+                  id_proyecto: ${id_proyecto}
+                  region: ${region}
+                  nombre_trabajo: "trabajo-exploracion"
+                  etiqueta_etapa: "EXPLORACION"
+                  fecha_ejecucion: ${fecha_ejecucion}
+                  ids_clientes: ${ids_clientes}
+                result: resultado_exploracion
+
+            # 4. MÓDULO DE GENERACIÓN DE INSIGHTS (Cloud Run Job - 1 tarea por cliente)
+            - paso_4_insights:
+                call: ejecutar_trabajo_etapa
+                args:
+                  id_proyecto: ${id_proyecto}
+                  region: ${region}
+                  nombre_trabajo: "trabajo-generacion-insights"
+                  etiqueta_etapa: "GENERACION_DE_INSIGHTS"
+                  fecha_ejecucion: ${fecha_ejecucion}
+                  ids_clientes: ${ids_clientes}
+                result: resultado_insights
+
+            # 5. MÓDULO DE NOTIFICACIONES (Supabase Edge Function - Una sola ejecución)
+            - obtener_secreto_notificaciones:
+                call: googleapis.secretmanager.v1.projects.secrets.versions.accessString
+                args:
+                  secret_id: ${nombre_secreto_notificaciones}
+                  project_id: ${id_proyecto}
+                result: secreto_notificaciones
+
+            - obtener_anon_key_supabase:
+                call: googleapis.secretmanager.v1.projects.secrets.versions.accessString
+                args:
+                  secret_id: ${nombre_secreto_supabase_anon}
+                  project_id: ${id_proyecto}
+                result: clave_anon_supabase
+
+            - paso_5_notificaciones:
+                try:
+                  call: http.post
+                  args:
+                    url: ${url_notificaciones}
+                    headers:
+                      Authorization: ${"Bearer " + clave_anon_supabase}
+                      X-Workflow-Secret: ${secreto_notificaciones}
+                      Content-Type: "application/json"
+                    body:
+                      fecha_ejecucion: ${fecha_ejecucion}
+                      ids_clientes: ${ids_clientes}
+                    timeout: 150
+                  result: respuesta_notificaciones
+                retry:
+                  predicate: ${predicado_reintento_http}
+                  max_retries: 3
+                  backoff:
+                    initial_delay: 5
+                    max_delay: 60
+                    multiplier: 2
+        except:
+          as: error_pipeline
+          steps:
+            - apagar_pod_por_error:
+                call: apagar_pod_runpod
+                args:
+                  pod_id: ${pod_id}
+                  runpod_api_key: ${runpod_api_key}
+                result: resultado_apagado_error
+            - relanzar_error_pipeline:
+                raise: ${error_pipeline}
+
+    - apagar_pod_al_finalizar:
+        call: apagar_pod_runpod
+        args:
+          pod_id: ${pod_id}
+          runpod_api_key: ${runpod_api_key}
+        result: resultado_apagado_pod
+
+    # -------------------------------------------------------------------------
+    # 6. CIERRE Y REPORTE DE AUDITORÍA DEL FLUJO
+    # -------------------------------------------------------------------------
+    - finalizar_con_exito:
+        return:
+          estado: "COMPLETADO"
+          fecha_ejecucion: ${fecha_ejecucion}
+          cantidad_clientes_iniciales: ${total_clientes}
+          ids_clientes: ${ids_clientes}
+          pod_runpod: ${resultado_apagado_pod}
+          etapas:
+            deteccion: ${resultado_deteccion}
+            exploracion: ${resultado_exploracion}
+            insights: ${resultado_insights}
+          notificaciones: ${respuesta_notificaciones.body}
+
+    - finalizar_sin_clientes:
+        return:
+          estado: "OMITIDO_SIN_CLIENTES_LISTOS"
+          fecha_ejecucion: ${fecha_ejecucion}
+
+
+# =============================================================================
+# SUBFLUJOS PARA CICLO DE VIDA DEL POD vLLM EN RUNPOD
+# =============================================================================
+encender_pod_runpod:
+  params: [nombre_pod, runpod_api_key, vllm_api_key]
+  steps:
+    - inicializar_config_pod:
+        assign:
+          - url_runpod_pods: "https://api.runpod.io/v2/pods"
+          - gpus_candidatas:
+              - "NVIDIA A40"
+              - "NVIDIA RTX A6000"
+              - "NVIDIA L40"
+          - args_pod: "--model cyankiwi/Qwen3.5-27B-AWQ-4bit --port 8000 --reasoning-parser qwen3 --max-model-len 65536 --limit-mm-per-prompt '{\"image\":40}'"
+          - pod_id_encontrado: null
+
+    - listar_pods_existentes:
+        try:
+          call: http.get
+          args:
+            url: ${url_runpod_pods}
+            headers:
+              Authorization: ${"Bearer " + runpod_api_key}
+              User-Agent: "FriccionInsightsBot/1.0"
+            timeout: 30
+          result: resp_pods
+        retry:
+          predicate: ${predicado_reintento_http}
+          max_retries: 3
+          backoff:
+            initial_delay: 5
+            max_delay: 30
+            multiplier: 2
+
+    - normalizar_lista_pods:
+        try:
+          assign:
+            - lista_pods: ${default(map.get(resp_pods.body, "pods"), default(map.get(resp_pods.body, "data"), []))}
+        except:
+          assign:
+            - lista_pods: ${resp_pods.body}
+
+    - buscar_pod_existente:
+        for:
+          value: pod
+          in: ${lista_pods}
+          steps:
+            - verificar_nombre_pod:
+                switch:
+                  - condition: ${map.get(pod, "name") == nombre_pod}
+                    steps:
+                      - guardar_pod_existente:
+                          assign:
+                            - pod_id_encontrado: ${map.get(pod, "id")}
+                          next: break
+
+    - reutilizar_si_existe:
+        switch:
+          - condition: ${pod_id_encontrado != null}
+            steps:
+              - log_pod_reutilizado:
+                  call: sys.log
+                  args:
+                    text: ${"Reutilizando Pod RunPod existente '" + nombre_pod + "' (" + pod_id_encontrado + ")."}
+                    severity: "INFO"
+              - retornar_pod_existente:
+                  return: ${pod_id_encontrado}
+
+    - crear_pod_con_fallback_gpu:
+        for:
+          value: gpu_id
+          in: ${gpus_candidatas}
+          steps:
+            - intentar_crear_pod:
+                try:
+                  call: http.post
+                  args:
+                    url: ${url_runpod_pods}
+                    headers:
+                      Authorization: ${"Bearer " + runpod_api_key}
+                      Content-Type: "application/json"
+                      User-Agent: "FriccionInsightsBot/1.0"
+                    body:
+                      name: ${nombre_pod}
+                      image: "vllm/vllm-openai:nightly"
+                      args: ${args_pod}
+                      env:
+                        VLLM_API_KEY: ${vllm_api_key}
+                      disk: 50
+                      ports:
+                        - "8000/http"
+                      gpu:
+                        id: ${gpu_id}
+                        count: 1
+                    timeout: 30
+                  result: resp_crear_pod
+                except:
+                  as: err_crear_pod
+                  steps:
+                    - log_gpu_no_disponible:
+                        call: sys.log
+                        args:
+                          text: '${"No se pudo crear el Pod " + nombre_pod + " con GPU " + gpu_id + ": " + json.encode_to_string(err_crear_pod)}'
+                          severity: "WARNING"
+                        next: continue
+            - guardar_pod_creado:
+                assign:
+                  - pod_id_encontrado: ${resp_crear_pod.body.id}
+            - log_pod_creado:
+                call: sys.log
+                args:
+                  text: ${"Pod RunPod '" + nombre_pod + "' creado (" + pod_id_encontrado + ") con GPU '" + gpu_id + "'."}
+                  severity: "INFO"
+                next: break
+
+    - verificar_creacion_pod:
+        switch:
+          - condition: ${pod_id_encontrado == null}
+            raise: ${"No se pudo desplegar el Pod '" + nombre_pod + "' en RunPod con ninguna GPU candidata."}
+
+    - retornar_pod_creado:
+        return: ${pod_id_encontrado}
+
+
+apagar_pod_runpod:
+  params: [pod_id, runpod_api_key]
+  steps:
+    - verificar_pod_id:
+        switch:
+          - condition: ${pod_id == null or pod_id == ""}
+            return:
+              estado: "SIN_POD"
+
+    - eliminar_pod:
+        try:
+          call: http.delete
+          args:
+            url: ${"https://api.runpod.io/v2/pods/" + pod_id}
+            headers:
+              Authorization: ${"Bearer " + runpod_api_key}
+              User-Agent: "FriccionInsightsBot/1.0"
+            timeout: 30
+          result: resp_delete
+        retry:
+          predicate: ${predicado_reintento_http}
+          max_retries: 3
+          backoff:
+            initial_delay: 5
+            max_delay: 30
+            multiplier: 2
+        except:
+          as: err_delete
+          steps:
+            - log_error_apagado:
+                call: sys.log
+                args:
+                  text: '${"No se pudo eliminar el Pod " + pod_id + " en RunPod: " + json.encode_to_string(err_delete)}'
+                  severity: "ERROR"
+            - retornar_error_apagado:
+                return:
+                  estado: "ERROR_AL_APAGAR"
+                  pod_id: ${pod_id}
+
+    - log_pod_eliminado:
+        call: sys.log
+        args:
+          text: '${"Pod RunPod eliminado correctamente: " + pod_id}'
+          severity: "INFO"
+
+    - retornar_apagado:
+        return:
+          estado: "ELIMINADO"
+          pod_id: ${pod_id}
+
+
+# =============================================================================
+# SUBFLUJO REUTILIZABLE PARA EJECUTAR CLOUD RUN JOBS POR CLIENTE
+# =============================================================================
+ejecutar_trabajo_etapa:
+  params: [id_proyecto, region, nombre_trabajo, etiqueta_etapa, fecha_ejecucion, ids_clientes]
+  steps:
+    - inicializar_variables:
+        assign:
+          - total_tareas: ${len(ids_clientes)}
+          - nombre_recurso_trabajo: ${"projects/" + id_proyecto + "/locations/" + region + "/jobs/" + nombre_trabajo}
+
+    - lanzar_trabajo:
+        try:
+          call: googleapis.run.v2.projects.locations.jobs.run
+          args:
+            name: ${nombre_recurso_trabajo}
+            body:
+              overrides:
+                taskCount: ${total_tareas}
+                containerOverrides:
+                  - env:
+                      - name: "FECHA_EJECUCION"
+                        value: ${fecha_ejecucion}
+                      - name: "IDS_CLIENTES"
+                        value: ${json.encode_to_string(ids_clientes)}
+          result: ejecucion_trabajo
+        retry:
+          predicate: ${predicado_reintento_api_jobs}
+          max_retries: 3
+          backoff:
+            initial_delay: 10
+            max_delay: 120
+            multiplier: 2
+        except:
+          as: error_trabajo
+          steps:
+            - inicializar_contadores_fallo:
+                assign:
+                  - tareas_exitosas: ${map.get(error_trabajo, ["body", "Response", "succeededCount"])}
+                  - tareas_fallidas: ${map.get(error_trabajo, ["body", "Response", "failedCount"])}
+
+            - consultar_ultima_ejecucion_si_falta_detalle:
+                switch:
+                  - condition: ${tareas_exitosas == null or tareas_fallidas == null}
+                    steps:
+                      - obtener_ultima_ejecucion:
+                          try:
+                            call: googleapis.run.v2.projects.locations.jobs.executions.list
+                            args:
+                              parent: ${nombre_recurso_trabajo}
+                              pageSize: 1
+                            result: lista_ejecuciones
+                          except:
+                            as: err_list
+                            steps:
+                              - fallback_contadores:
+                                  assign:
+                                    - lista_ejecuciones: {}
+                      - extraer_contadores_ejecucion:
+                          assign:
+                            - ejecuciones: ${default(map.get(lista_ejecuciones, "executions"), [])}
+                      - asignar_desde_ejecucion:
+                          switch:
+                            - condition: ${len(ejecuciones) > 0}
+                              steps:
+                                - set_contadores_ejecucion:
+                                    assign:
+                                      - tareas_exitosas: ${default(map.get(ejecuciones[0], "succeededCount"), 0)}
+                                      - tareas_fallidas: ${default(map.get(ejecuciones[0], "failedCount"), total_tareas)}
+                            - condition: true
+                              steps:
+                                - set_contadores_fallback:
+                                    assign:
+                                      - tareas_exitosas: 0
+                                      - tareas_fallidas: ${total_tareas}
+
+            - verificar_fallo_total_modulo:
+                switch:
+                  - condition: ${tareas_exitosas == 0}
+                    steps:
+                      - registrar_aborto_critico:
+                          call: sys.log
+                          args:
+                            text: ${"FALLO TOTAL en módulo " + etiqueta_etapa + " para fecha " + fecha_ejecucion + ". Deteniendo el pipeline."}
+                            severity: "CRITICAL"
+                      - abortar_pipeline:
+                          raise: ${error_trabajo}
+
+            - registrar_fallo_parcial:
+                call: sys.log
+                args:
+                  text: '${"Fallo parcial en " + etiqueta_etapa + ": " + string(tareas_exitosas) + " exitosos, " + string(tareas_fallidas) + " fallidos. El ciclo continúa."}'
+                  severity: "WARNING"
+
+            - retornar_exito_parcial:
+                return:
+                  estado: "EXITO_PARCIAL"
+                  tareas_exitosas: ${tareas_exitosas}
+                  tareas_fallidas: ${tareas_fallidas}
+
+    - retornar_exito_total:
+        return:
+          estado: "EXITOSO"
+          tareas_exitosas: ${total_tareas}
+          tareas_fallidas: 0
+
+
+# =============================================================================
+# PREDICADO DE REINTENTO PARA SERVICIOS HTTP (NIVEL 2 - MÓDULOS 1 Y 5)
+# Extiende http.default_retry_predicate (429, 502, 503, 504, timeouts/red)
+# sumando explícitamente el código HTTP 500.
+# =============================================================================
+predicado_reintento_http:
+  params: [e]
+  steps:
+    - verificar_error_http:
+        switch:
+          - condition: ${http.default_retry_predicate(e) or map.get(e, "code") == 500}
+            return: true
+    - no_reintentar:
+        return: false
+
+
+# =============================================================================
+# PREDICADO DE REINTENTO PARA LA API DE CLOUD RUN JOBS (NIVEL 2 - MÓDULOS 2, 3 Y 4)
+# =============================================================================
+predicado_reintento_api_jobs:
+  params: [error_api]
+  steps:
+    - verificar_codigo_http:
+        switch:
+          - condition: ${map.get(error_api, "code") in [429, 502, 503, 504]}
+            return: true
+    - no_reintentar:
+        return: false

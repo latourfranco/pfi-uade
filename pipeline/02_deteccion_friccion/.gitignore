@@ -1,0 +1,24 @@
+# Modelos guardados en local (sin MODELOS_BUCKET, modulo/almacen.py)
+/resultados/
+
+# Pruebas: reportes y datos de cobertura (se regeneran con pytest)
+/reports/
+.coverage
+.coverage.*
+coverage-python.info
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Secretos: nunca al repo (en Cloud Run van por Secret Manager como variables de entorno)
+.env
+*.env
+*.json.key
+credenciales/

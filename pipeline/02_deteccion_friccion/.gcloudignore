@@ -1,0 +1,11 @@
+# Qué se sube a Cloud Build para armar la imagen del Job: solo el Dockerfile y el código.
+*
+!Dockerfile
+!modulo/
+!modulo/*.py
+!modulo/requirements.txt
+!ingesta/
+!ingesta/*.py
+!preprocesamiento/
+!preprocesamiento/*.py
+__pycache__/
